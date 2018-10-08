@@ -62,8 +62,15 @@
  */
 #define CGROUP_CPUSET_IS_OPTIONAL (GP_VERSION_NUM < 60000)
 
+typedef enum BaseType BaseType;
 typedef struct PermItem PermItem;
 typedef struct PermList PermList;
+
+enum BaseType
+{
+	BASETYPE_GPDB,		/* translate to "/gpdb" */
+	BASETYPE_PARENT,	/* translate to "" */
+};
 
 struct PermItem
 {
@@ -98,7 +105,7 @@ static void detectCompDirs(void);
 static bool validateCompDir(ResGroupCompType comp);
 static void dumpCompDirs(void);
 
-static char *buildPath(Oid group, const char *base, ResGroupCompType comp, const char *prop, char *path, size_t pathsize);
+static char *buildPath(Oid group, BaseType base, ResGroupCompType comp, const char *prop, char *path, size_t pathsize);
 static int lockDir(const char *path, bool block);
 static void unassignGroup(Oid group, ResGroupCompType comp, int fddir);
 static bool createDir(Oid group, ResGroupCompType comp);
@@ -106,8 +113,10 @@ static bool removeDir(Oid group, ResGroupCompType comp, const char *prop, bool u
 static int getCpuCores(void);
 static size_t readData(const char *path, char *data, size_t datasize);
 static void writeData(const char *path, const char *data, size_t datasize);
-static int64 readInt64(Oid group, const char *base, ResGroupCompType comp, const char *prop);
-static void writeInt64(Oid group, const char *base, ResGroupCompType comp, const char *prop, int64 x);
+static int64 readInt64(Oid group, BaseType base, ResGroupCompType comp, const char *prop);
+static void writeInt64(Oid group, BaseType base, ResGroupCompType comp, const char *prop, int64 x);
+static void readStr(Oid group, BaseType base, ResGroupCompType comp, const char *prop, char *str, int len);
+static void writeStr(Oid group, BaseType base, ResGroupCompType comp, const char *prop, const char *strValue);
 static bool permListCheck(const PermList *permlist, Oid group, bool report);
 static bool checkPermission(Oid group, bool report);
 static bool checkCpuSetPermission(Oid group, bool report);
@@ -115,6 +124,8 @@ static void getMemoryInfo(unsigned long *ram, unsigned long *swap);
 static void getCgMemoryInfo(uint64 *cgram, uint64 *cgmemsw);
 static int getOvercommitRatio(void);
 static bool detectCgroupMountPoint(void);
+static void initCpu(void);
+static void initCpuSet(void);
 static void createDefaultCpuSetGroup(void);
 
 /*
@@ -125,6 +136,10 @@ static Oid currentGroupIdInCGroup = InvalidOid;
 static ResGroupCaps oldCaps;
 
 static char cgdir[MAXPGPATH];
+
+static int64 system_cfs_quota_us = -1LL;
+static int64 parent_cfs_quota_us = -1LL;
+static int ncores;
 
 /*
  * These checks should keep in sync with gpMgmt/bin/gpcheckresgroupimpl
@@ -172,7 +187,8 @@ static const PermItem perm_items_swap[] =
 /*
  * just for cpuset check, same as the cpuset Permlist in permlists
  */
-static const PermList cpusetPermList = {
+static const PermList cpusetPermList =
+{
 	perm_items_cpuset,
 	CGROUP_CPUSET_IS_OPTIONAL,
 	&gp_resource_group_enable_cgroup_cpuset,
@@ -424,7 +440,7 @@ validateCompDir(ResGroupCompType comp)
 	char		path[MAXPGPATH];
 	size_t		pathsize = sizeof(path);
 
-	buildPath(RESGROUP_ROOT_ID, NULL, comp, "", path, pathsize);
+	buildPath(RESGROUP_ROOT_ID, BASETYPE_GPDB, comp, "", path, pathsize);
 
 	return access(path, R_OK | W_OK | X_OK) == 0;
 }
@@ -441,7 +457,7 @@ dumpCompDirs(void)
 
 	foreach_comp_type(comp)
 	{
-		buildPath(RESGROUP_ROOT_ID, NULL, comp, "", path, pathsize);
+		buildPath(RESGROUP_ROOT_ID, BASETYPE_GPDB, comp, "", path, pathsize);
 
 		elog(LOG, "gpdb dir for cgroup component \"%s\": %s",
 			 compGetName(comp), path);
@@ -450,13 +466,16 @@ dumpCompDirs(void)
 
 /*
  * Build path string with parameters.
- * - if base is NULL, use default value "gpdb"
- * - if group is RESGROUP_ROOT_ID then the path is for the gpdb toplevel cgroup;
- * - if prop is "" then the path is for the cgroup dir;
+ *
+ * Examples (path and pathsize are omitted):
+ * - buildPath(ROOT, CPU, PARENT, ""     ): /sys/fs/cgroup/cpu
+ * - buildPath(ROOT, CPU, PARENT, "tasks"): /sys/fs/cgroup/cpu/tasks
+ * - buildPath(ROOT, CPU, GPDB  , "tasks"): /sys/fs/cgroup/cpu/gpdb/tasks
+ * - buildPath(6437, CPU, GPDB  , "tasks"): /sys/fs/cgroup/cpu/gpdb/6437/tasks
  */
 static char *
 buildPath(Oid group,
-		  const char *base,
+		  BaseType base,
 		  ResGroupCompType comp,
 		  const char *prop,
 		  char *path,
@@ -464,26 +483,26 @@ buildPath(Oid group,
 {
 	const char *compname = compGetName(comp);
 	const char *compdir = compGetDir(comp);
+	const char *basedir = "";
 
 	Assert(cgdir[0] != 0);
+	Assert(base == BASETYPE_GPDB ||
+		   base == BASETYPE_PARENT);
 
-	if (!base)
-		base = "gpdb";
+	if (base == BASETYPE_GPDB)
+		basedir = "/gpdb";
+	else
+		basedir = "";
 
-	if (group == RESGROUP_COMPROOT_ID)
+	if (group != RESGROUP_ROOT_ID)
 	{
-		snprintf(path, pathsize, "%s/%s%s/%s",
-				 cgdir, compname, compdir, prop);
-	}
-	else if (group != RESGROUP_ROOT_ID)
-	{
-		snprintf(path, pathsize, "%s/%s%s/%s/%d/%s",
-				 cgdir, compname, compdir, base, group, prop);
+		snprintf(path, pathsize, "%s/%s%s%s/%d/%s",
+				 cgdir, compname, compdir, basedir, group, prop);
 	}
 	else
 	{
-		snprintf(path, pathsize, "%s/%s%s/%s/%s",
-				 cgdir, compname, compdir, base, prop);
+		snprintf(path, pathsize, "%s/%s%s%s/%s",
+				 cgdir, compname, compdir, basedir, prop);
 	}
 
 	return path;
@@ -532,7 +551,7 @@ unassignGroup(Oid group, ResGroupCompType comp, int fddir)
 	} \
 } while (0)
 
-	buildPath(group, NULL, comp, "cgroup.procs", path, pathsize);
+	buildPath(group, BASETYPE_GPDB, comp, "cgroup.procs", path, pathsize);
 
 	fdr = open(path, O_RDONLY);
 	__CHECK(fdr >= 0, ( close(fddir) ), "can't open file for read");
@@ -559,7 +578,8 @@ unassignGroup(Oid group, ResGroupCompType comp, int fddir)
 	if (buflen == 0)
 		return;
 
-	buildPath(RESGROUP_ROOT_ID, NULL, comp, "cgroup.procs", path, pathsize);
+	buildPath(RESGROUP_ROOT_ID, BASETYPE_GPDB, comp, "cgroup.procs",
+			  path, pathsize);
 
 	fdw = open(path, O_WRONLY);
 	__CHECK(fdw >= 0, ( close(fddir) ), "can't open file for write");
@@ -696,7 +716,7 @@ createDir(Oid group, ResGroupCompType comp)
 	char path[MAXPGPATH];
 	size_t pathsize = sizeof(path);
 
-	buildPath(group, NULL, comp, "", path, pathsize);
+	buildPath(group, BASETYPE_GPDB, comp, "", path, pathsize);
 
 	if (mkdir(path, 0755) && errno != EEXIST)
 		return false;
@@ -717,7 +737,7 @@ removeDir(Oid group, ResGroupCompType comp, const char *prop, bool unassign)
 	int retry = unassign ? 0 : MAX_RETRY - 1;
 	int fddir;
 
-	buildPath(group, NULL, comp, "", path, pathsize);
+	buildPath(group, BASETYPE_GPDB, comp, "", path, pathsize);
 
 	/*
 	 * To prevent race condition between multiple processes we require a dir
@@ -734,7 +754,7 @@ removeDir(Oid group, ResGroupCompType comp, const char *prop, bool unassign)
 	 * Reset the corresponding control file to zero
 	 */
 	if (prop)
-		writeInt64(group, NULL, comp, prop, 0);
+		writeInt64(group, BASETYPE_GPDB, comp, prop, 0);
 
 	while (++retry <= MAX_RETRY)
 	{
@@ -784,7 +804,7 @@ removeDir(Oid group, ResGroupCompType comp, const char *prop, bool unassign)
 static int
 getCpuCores(void)
 {
-	static int cpucores = 0;
+	int cpucores = 0;
 
 	/*
 	 * cpuset ops requires _GNU_SOURCE to be defined,
@@ -793,9 +813,6 @@ getCpuCores(void)
 	 */
 	cpu_set_t cpuset;
 	int i;
-
-	if (cpucores != 0)
-		return cpucores;
 
 	if (sched_getaffinity(0, sizeof(cpuset), &cpuset) < 0)
 		CGROUP_ERROR("can't get cpu cores: %s", strerror(errno));
@@ -860,7 +877,7 @@ writeData(const char *path, const char *data, size_t datasize)
  * Read an int64 value from a cgroup interface file.
  */
 static int64
-readInt64(Oid group, const char *base, ResGroupCompType comp, const char *prop)
+readInt64(Oid group, BaseType base, ResGroupCompType comp, const char *prop)
 {
 	int64 x;
 	char data[MAX_INT_STRING_LEN];
@@ -882,7 +899,7 @@ readInt64(Oid group, const char *base, ResGroupCompType comp, const char *prop)
  * Write an int64 value to a cgroup interface file.
  */
 static void
-writeInt64(Oid group, const char *base,
+writeInt64(Oid group, BaseType base,
 		   ResGroupCompType comp, const char *prop, int64 x)
 {
 	char data[MAX_INT_STRING_LEN];
@@ -900,7 +917,7 @@ writeInt64(Oid group, const char *base,
  * Read a string value from a cgroup interface file.
  */
 static void
-readStr(Oid group, const char *base,
+readStr(Oid group, BaseType base,
 		ResGroupCompType comp, const char *prop, char *str, int len)
 {
 	char data[MAX_INT_STRING_LEN];
@@ -919,7 +936,7 @@ readStr(Oid group, const char *base,
  * Write an string value to a cgroup interface file.
  */
 static void
-writeStr(Oid group, const char *base,
+writeStr(Oid group, BaseType base,
 		 ResGroupCompType comp, const char *prop, const char *strValue)
 {
 	char path[MAXPGPATH];
@@ -953,7 +970,7 @@ permListCheck(const PermList *permlist, Oid group, bool report)
 		const char	*prop = permlist->items[i].prop;
 		int			perm = permlist->items[i].perm;
 
-		buildPath(group, NULL, comp, prop, path, pathsize);
+		buildPath(group, BASETYPE_GPDB, comp, prop, path, pathsize);
 
 		if (access(path, perm))
 		{
@@ -1033,11 +1050,12 @@ getCgMemoryInfo(uint64 *cgram, uint64 *cgmemsw)
 {
 	ResGroupCompType comp = RESGROUP_COMP_TYPE_MEMORY;
 
-	*cgram = readInt64(RESGROUP_ROOT_ID, "", comp, "memory.limit_in_bytes");
+	*cgram = readInt64(RESGROUP_ROOT_ID, BASETYPE_PARENT,
+					   comp, "memory.limit_in_bytes");
 
 	if (gp_resource_group_enable_cgroup_swap)
 	{
-		*cgmemsw = readInt64(RESGROUP_ROOT_ID, "",
+		*cgmemsw = readInt64(RESGROUP_ROOT_ID, BASETYPE_PARENT,
 							 comp, "memory.memsw.limit_in_bytes");
 	}
 	else
@@ -1101,6 +1119,92 @@ detectCgroupMountPoint(void)
 	return !!cgdir[0];
 }
 
+/*
+ * Init gpdb cpu settings.
+ *
+ * Must be called after Probe() and Bless().
+ */
+static void
+initCpu(void)
+{
+	ResGroupCompType comp = RESGROUP_COMP_TYPE_CPU;
+	int64		cfs_quota_us;
+	int64		shares;
+
+	if (parent_cfs_quota_us < 0LL)
+	{
+		/*
+		 * parent cgroup is unlimited, calculate gpdb's limitation based on
+		 * system hardware configuration.
+		 *
+		 * cfs_quota_us := parent.cfs_period_us * ncores * gp_resource_group_cpu_limit
+		 */
+		cfs_quota_us = system_cfs_quota_us * gp_resource_group_cpu_limit;
+	}
+	else
+	{
+		/*
+		 * parent cgroup is also limited, then calculate gpdb's limitation
+		 * based on it.
+		 *
+		 * cfs_quota_us := parent.cfs_quota_us * gp_resource_group_cpu_limit
+		 */
+		cfs_quota_us = parent_cfs_quota_us * gp_resource_group_cpu_limit;
+	}
+
+	/*
+	 * shares := parent.shares * gp_resource_group_cpu_priority
+	 *
+	 * We used to set a large shares (like 1024 * 256, the maximum possible
+	 * value), it has very bad effect on overall system performance,
+	 * especially on 1-core or 2-core low-end systems.
+	 * Processes in a cold cgroup get launched and scheduled with large
+	 * latency (a simple `cat a.txt` may executes for more than 100s).
+	 * Here a cold cgroup is a cgroup that doesn't have active running
+	 * processes, this includes not only the toplevel system cgroup,
+	 * but also the inactive gpdb resgroups.
+	 */
+	shares = readInt64(RESGROUP_ROOT_ID, BASETYPE_PARENT, comp, "cpu.shares");
+	shares = shares * gp_resource_group_cpu_priority;
+
+	writeInt64(RESGROUP_ROOT_ID, BASETYPE_GPDB,
+			   comp, "cpu.cfs_quota_us", cfs_quota_us);
+	writeInt64(RESGROUP_ROOT_ID, BASETYPE_GPDB,
+			   comp, "cpu.shares", shares);
+}
+
+/*
+ * Init gpdb cpuset settings.
+ *
+ * Must be called after Probe() and Bless().
+ */
+static void
+initCpuSet(void)
+{
+	ResGroupCompType comp = RESGROUP_COMP_TYPE_CPUSET;
+	char		buffer[MaxCpuSetLength];
+
+	if (!gp_resource_group_enable_cgroup_cpuset)
+		return;
+
+	/*
+	 * Get cpuset.mems and cpuset.cpus values from cgroup cpuset root path,
+	 * and set them to cpuset/gpdb/cpuset.mems and cpuset/gpdb/cpuset.cpus
+	 * to make sure that gpdb directory configuration is same as its
+	 * parent directory
+	 */
+
+	readStr(RESGROUP_ROOT_ID, BASETYPE_PARENT, comp, "cpuset.mems",
+			buffer, sizeof(buffer));
+	writeStr(RESGROUP_ROOT_ID, BASETYPE_GPDB, comp, "cpuset.mems", buffer);
+
+	readStr(RESGROUP_ROOT_ID, BASETYPE_PARENT, comp, "cpuset.cpus",
+			buffer, sizeof(buffer));
+	writeStr(RESGROUP_ROOT_ID, BASETYPE_GPDB, comp, "cpuset.cpus", buffer);
+
+	createDefaultCpuSetGroup();
+}
+
 /* Return the name for the OS group implementation */
 const char *
 ResGroupOps_Name(void)
@@ -1147,6 +1251,9 @@ ResGroupOps_Probe(void)
 void
 ResGroupOps_Bless(void)
 {
+	ResGroupCompType comp = RESGROUP_COMP_TYPE_CPU;
+	int64		cfs_period_us;
+
 	/*
 	 * We only have to do these checks and initialization once on each host,
 	 * so only let postmaster do the job.
@@ -1173,57 +1280,31 @@ ResGroupOps_Bless(void)
 	 * Check detectCompDirs() to know why this is not done in that function.
 	 */
 	dumpCompDirs();
+
+	/*
+	 * Get some necessary system information.
+	 * We can not do them in Probe() as failure is not allowed in that one.
+	 */
+
+	/* get system cpu cores */
+	ncores = getCpuCores();
+
+	/* calculate cpu rate limit of system */
+	cfs_period_us = readInt64(RESGROUP_ROOT_ID, BASETYPE_PARENT,
+							  comp, "cpu.cfs_period_us");
+	system_cfs_quota_us = cfs_period_us * ncores;
+
+	/* read cpu rate limit of parent cgroup */
+	parent_cfs_quota_us = readInt64(RESGROUP_ROOT_ID, BASETYPE_PARENT,
+									comp, "cpu.cfs_quota_us");
 }
 
 /* Initialize the OS group */
 void
 ResGroupOps_Init(void)
 {
-	/*
-	 * cfs_quota_us := cfs_period_us * ncores * gp_resource_group_cpu_limit
-	 * shares := 1024 * gp_resource_group_cpu_priority
-	 *
-	 * We used to set a large shares (like 1024 * 256, the maximum possible
-	 * value), it has very bad effect on overall system performance,
-	 * especially on 1-core or 2-core low-end systems.
-	 * Processes in a cold cgroup get launched and scheduled with large
-	 * latency (a simple `cat a.txt` may executes for more than 100s).
-	 * Here a cold cgroup is a cgroup that doesn't have active running
-	 * processes, this includes not only the toplevel system cgroup,
-	 * but also the inactive gpdb resgroups.
-	 */
-
-	int64 cfs_period_us;
-	int ncores = getCpuCores();
-	ResGroupCompType comp = RESGROUP_COMP_TYPE_CPU;
-
-	cfs_period_us = readInt64(RESGROUP_ROOT_ID, NULL, comp, "cpu.cfs_period_us");
-	writeInt64(RESGROUP_ROOT_ID, NULL, comp, "cpu.cfs_quota_us",
-			   cfs_period_us * ncores * gp_resource_group_cpu_limit);
-	writeInt64(RESGROUP_ROOT_ID, NULL, comp, "cpu.shares",
-			   1024LL * gp_resource_group_cpu_priority);
-
-	if (gp_resource_group_enable_cgroup_cpuset)
-	{
-		/*
-		 * Get cpuset.mems and cpuset.cpus values from cgroup cpuset root path,
-		 * and set them to cpuset/gpdb/cpuset.mems and cpuset/gpdb/cpuset.cpus
-		 * to make sure that gpdb directory configuration is same as its
-		 * parent directory
-		 */
-		char buffer[MaxCpuSetLength];
-
-		comp = RESGROUP_COMP_TYPE_CPUSET;
-
-		readStr(RESGROUP_COMPROOT_ID, NULL, comp, "cpuset.mems",
-				buffer, sizeof(buffer));
-		writeStr(RESGROUP_ROOT_ID, NULL, comp, "cpuset.mems", buffer);
-		readStr(RESGROUP_COMPROOT_ID, NULL, comp, "cpuset.cpus",
-				buffer, sizeof(buffer));
-		writeStr(RESGROUP_ROOT_ID, NULL, comp, "cpuset.cpus", buffer);
-
-		createDefaultCpuSetGroup();
-	}
+	initCpu();
+	initCpuSet();
 
 	/*
 	 * Put postmaster and all the children processes into the gpdb cgroup,
@@ -1290,13 +1371,13 @@ ResGroupOps_CreateGroup(Oid group)
 		ResGroupCompType comp = RESGROUP_COMP_TYPE_CPUSET;
 		char buffer[MaxCpuSetLength];
 
-		readStr(RESGROUP_ROOT_ID, NULL, comp, "cpuset.mems",
+		readStr(RESGROUP_ROOT_ID, BASETYPE_GPDB, comp, "cpuset.mems",
 				buffer, sizeof(buffer));
-		writeStr(group, NULL, comp, "cpuset.mems", buffer);
+		writeStr(group, BASETYPE_GPDB, comp, "cpuset.mems", buffer);
 
-		readStr(RESGROUP_ROOT_ID, NULL, comp, "cpuset.cpus",
+		readStr(RESGROUP_ROOT_ID, BASETYPE_GPDB, comp, "cpuset.cpus",
 				buffer, sizeof(buffer));
-		writeStr(group, NULL, comp, "cpuset.cpus", buffer);
+		writeStr(group, BASETYPE_GPDB, comp, "cpuset.cpus", buffer);
 	}
 }
 
@@ -1339,13 +1420,13 @@ createDefaultCpuSetGroup(void)
 	 */
 	char buffer[MaxCpuSetLength];
 
-	readStr(RESGROUP_ROOT_ID, NULL, comp, "cpuset.mems",
+	readStr(RESGROUP_ROOT_ID, BASETYPE_GPDB, comp, "cpuset.mems",
 			buffer, sizeof(buffer));
-	writeStr(DEFAULT_CPUSET_GROUP_ID, NULL, comp, "cpuset.mems", buffer);
+	writeStr(DEFAULT_CPUSET_GROUP_ID, BASETYPE_GPDB, comp, "cpuset.mems", buffer);
 
-	readStr(RESGROUP_ROOT_ID, NULL, comp, "cpuset.cpus",
+	readStr(RESGROUP_ROOT_ID, BASETYPE_GPDB, comp, "cpuset.cpus",
 			buffer, sizeof(buffer));
-	writeStr(DEFAULT_CPUSET_GROUP_ID, NULL, comp, "cpuset.cpus", buffer);
+	writeStr(DEFAULT_CPUSET_GROUP_ID, BASETYPE_GPDB, comp, "cpuset.cpus", buffer);
 }
 
 /*
@@ -1388,24 +1469,25 @@ ResGroupOps_AssignGroup(Oid group, ResGroupCaps *caps, int pid)
 	if (IsUnderPostmaster &&
 		group == currentGroupIdInCGroup &&
 		caps != NULL &&
-		oldViaCpuset == curViaCpuset
-		)
+		oldViaCpuset == curViaCpuset)
 		return;
 
-	writeInt64(group, NULL, RESGROUP_COMP_TYPE_CPU, "cgroup.procs", pid);
-	writeInt64(group, NULL, RESGROUP_COMP_TYPE_CPUACCT, "cgroup.procs", pid);
+	writeInt64(group, BASETYPE_GPDB, RESGROUP_COMP_TYPE_CPU,
+			   "cgroup.procs", pid);
+	writeInt64(group, BASETYPE_GPDB, RESGROUP_COMP_TYPE_CPUACCT,
+			   "cgroup.procs", pid);
 
 	if (gp_resource_group_enable_cgroup_cpuset)
 	{
 		if (caps == NULL || !curViaCpuset)
 		{
 			/* add pid to default group */
-			writeInt64(DEFAULT_CPUSET_GROUP_ID, NULL,
+			writeInt64(DEFAULT_CPUSET_GROUP_ID, BASETYPE_GPDB,
 					   RESGROUP_COMP_TYPE_CPUSET, "cgroup.procs", pid);
 		}
 		else
 		{
-			writeInt64(group, NULL,
+			writeInt64(group, BASETYPE_GPDB,
 					   RESGROUP_COMP_TYPE_CPUSET, "cgroup.procs", pid);
 		}
 	}
@@ -1438,7 +1520,7 @@ ResGroupOps_LockGroup(Oid group, ResGroupCompType comp, bool block)
 	char path[MAXPGPATH];
 	size_t pathsize = sizeof(path);
 
-	buildPath(group, NULL, comp, "", path, pathsize);
+	buildPath(group, BASETYPE_GPDB, comp, "", path, pathsize);
 
 	return lockDir(path, block);
 }
@@ -1465,10 +1547,12 @@ ResGroupOps_SetCpuRateLimit(Oid group, int cpu_rate_limit)
 {
 	ResGroupCompType comp = RESGROUP_COMP_TYPE_CPU;
 
-	/* SUB/shares := TOP/shares * cpu_rate_limit */
+	/* group.shares := gpdb.shares * cpu_rate_limit */
 
-	int64 shares = readInt64(RESGROUP_ROOT_ID, NULL, comp, "cpu.shares");
-	writeInt64(group, NULL, comp, "cpu.shares", shares * cpu_rate_limit / 100);
+	int64 shares = readInt64(RESGROUP_ROOT_ID, BASETYPE_GPDB, comp,
+							 "cpu.shares");
+	writeInt64(group, BASETYPE_GPDB, comp,
+			   "cpu.shares", shares * cpu_rate_limit / 100);
 }
 
 /*
@@ -1514,7 +1598,7 @@ ResGroupOps_SetMemoryLimitByValue(Oid group, int32 memory_limit)
 	if (!gp_resource_group_enable_cgroup_swap)
 	{
 		/* No, then we only need to setup the memory limit */
-		writeInt64(group, NULL, comp, "memory.limit_in_bytes",
+		writeInt64(group, BASETYPE_GPDB, comp, "memory.limit_in_bytes",
 				memory_limit_in_bytes);
 	}
 	else
@@ -1528,24 +1612,24 @@ ResGroupOps_SetMemoryLimitByValue(Oid group, int32 memory_limit)
 		 * must be set in a proper order depending on the relation between
 		 * new and old limits.
 		 */
-		memory_limit_in_bytes_old = readInt64(group, NULL,
-				comp, "memory.limit_in_bytes");
+		memory_limit_in_bytes_old = readInt64(group, BASETYPE_GPDB, comp,
+											  "memory.limit_in_bytes");
 
 		if (memory_limit_in_bytes > memory_limit_in_bytes_old)
 		{
 			/* When new value > old memory limit, write mem+swap limit first */
-			writeInt64(group, NULL, comp, "memory.memsw.limit_in_bytes",
-					memory_limit_in_bytes);
-			writeInt64(group, NULL, comp, "memory.limit_in_bytes",
-					memory_limit_in_bytes);
+			writeInt64(group, BASETYPE_GPDB, comp,
+					   "memory.memsw.limit_in_bytes", memory_limit_in_bytes);
+			writeInt64(group, BASETYPE_GPDB, comp,
+					   "memory.limit_in_bytes", memory_limit_in_bytes);
 		}
 		else if (memory_limit_in_bytes < memory_limit_in_bytes_old)
 		{
 			/* When new value < old memory limit,  write memory limit first */
-			writeInt64(group, NULL, comp, "memory.limit_in_bytes",
-					memory_limit_in_bytes);
-			writeInt64(group, NULL, comp, "memory.memsw.limit_in_bytes",
-					memory_limit_in_bytes);
+			writeInt64(group, BASETYPE_GPDB, comp,
+					   "memory.limit_in_bytes", memory_limit_in_bytes);
+			writeInt64(group, BASETYPE_GPDB, comp,
+					   "memory.memsw.limit_in_bytes", memory_limit_in_bytes);
 		}
 	}
 }
@@ -1558,8 +1642,22 @@ int64
 ResGroupOps_GetCpuUsage(Oid group)
 {
 	ResGroupCompType comp = RESGROUP_COMP_TYPE_CPUACCT;
+	/* usage indicates the cpu usage on the system */
+	int64		usage = readInt64(group, BASETYPE_GPDB, comp, "cpuacct.usage");
 
-	return readInt64(group, NULL, comp, "cpuacct.usage");
+	/* cgroup promises that cfs_quota_us will nevery be 0 */
+	Assert(parent_cfs_quota_us != 0);
+
+	if (parent_cfs_quota_us < 0LL)
+	{
+		/* parent cgroup is unlimited, return usage directly */
+		return usage;
+	}
+	else
+	{
+		/* parent cgroup is also limited, return the usage in parent cgroup */
+		return usage * system_cfs_quota_us / parent_cfs_quota_us;
+	}
 }
 
 /*
@@ -1582,7 +1680,7 @@ ResGroupOps_GetMemoryUsage(Oid group)
 		? "memory.memsw.usage_in_bytes"
 		: "memory.usage_in_bytes";
 
-	memory_usage_in_bytes = readInt64(group, NULL, comp, prop);
+	memory_usage_in_bytes = readInt64(group, BASETYPE_GPDB, comp, prop);
 
 	return VmemTracker_ConvertVmemBytesToChunks(memory_usage_in_bytes);
 }
@@ -1602,8 +1700,8 @@ ResGroupOps_GetMemoryLimit(Oid group)
 	if (!gp_resource_group_enable_cgroup_memory)
 		return (int32) ((1U << 31) - 1);
 
-	memory_limit_in_bytes = readInt64(group, NULL,
-			comp, "memory.limit_in_bytes");
+	memory_limit_in_bytes = readInt64(group, BASETYPE_GPDB,
+									  comp, "memory.limit_in_bytes");
 
 	return VmemTracker_ConvertVmemBytesToChunks(memory_limit_in_bytes);
 }
@@ -1614,7 +1712,7 @@ ResGroupOps_GetMemoryLimit(Oid group)
 int
 ResGroupOps_GetCpuCores(void)
 {
-	return getCpuCores();
+	return ncores;
 }
 
 /*
@@ -1669,7 +1767,7 @@ ResGroupOps_SetCpuSet(Oid group, const char *cpuset)
 	if (!gp_resource_group_enable_cgroup_cpuset)
 		return ;
 
-	writeStr(group, NULL, comp, "cpuset.cpus", cpuset);
+	writeStr(group, BASETYPE_GPDB, comp, "cpuset.cpus", cpuset);
 }
 
 /*
@@ -1686,5 +1784,5 @@ ResGroupOps_GetCpuSet(Oid group, char *cpuset, int len)
 	if (!gp_resource_group_enable_cgroup_cpuset)
 		return ;
 
-	readStr(group, NULL, comp, "cpuset.cpus", cpuset, len);
+	readStr(group, BASETYPE_GPDB, comp, "cpuset.cpus", cpuset, len);
 }
